@@ -1,7 +1,7 @@
 {
   "name": "agent-arcade",
   "version": "0.1.0",
-  "description": "Playful live view of Claude and its subagents: a stats band, an agent tree pane, an activity feed and toasts",
+  "description": "Playful live view of Claude and its subagents: an animated dashboard with usage, model and effort per agent, a stats band, an activity feed and toasts",
   "author": { "name": "Timoliao", "email": "liaozicheng@gmail.com" },
   "types": "./types/index.d.ts"
 }

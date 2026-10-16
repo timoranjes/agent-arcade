@@ -1,4 +1,4 @@
-import type { AgentNode, FeedEntry, TurnStats } from '../types'
+import type { AgentNode, FeedEntry, LimitSample, TurnStats } from '../types'
 
 export const MAIN = 'main'
 export const FEED_CAP = 50
@@ -145,4 +145,161 @@ export function bar(percent: number, width = 8): string {
 
 export function tokens(n: number): string {
   return n >= 1000 ? `${Math.round(n / 100) / 10}k` : String(n)
+}
+
+type Usage = { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number }
+
+/** All the tokens a call was answered over and generated. */
+export function totalTokens(u: Usage): number {
+  return u.input_tokens + u.output_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
+}
+
+/** Folds one turn's usage into an agent's running totals. */
+export function addUsage(node: AgentNode, u: Usage): Partial<AgentNode> {
+  return {
+    tokensIn: (node.tokensIn ?? 0) + u.input_tokens + u.cache_creation_input_tokens,
+    tokensOut: (node.tokensOut ?? 0) + u.output_tokens,
+    cacheRead: (node.cacheRead ?? 0) + u.cache_read_input_tokens,
+  }
+}
+
+export function agentTokens(node: AgentNode): number {
+  return (node.tokensIn ?? 0) + (node.tokensOut ?? 0) + (node.cacheRead ?? 0)
+}
+
+/** The share of input the prompt cache served, as a whole percent; undefined before any input. */
+export function cacheRate(cacheRead: number, input: number): number | undefined {
+  const all = cacheRead + input
+  return all > 0 ? Math.round((cacheRead / all) * 100) : undefined
+}
+
+/** `claude-opus-5-5` → `opus-5-5`; a dated suffix dropped. */
+export function shortModel(model: string | undefined): string {
+  if (!model) return '–'
+  return model.replace(/^claude-/, '').replace(/-\d{8}$/, '').replace(/\[1m\]$/, '')
+}
+
+const WINDOW_NAMES: Record<string, string> = { five_hour: '5-hour', seven_day: '7-day', spend_limit: 'spend' }
+const WINDOW_SHORT: Record<string, string> = { five_hour: '5h', seven_day: '7d', spend_limit: '$lim' }
+
+export function windowName(kind: string, isShort = false): string {
+  return (isShort ? WINDOW_SHORT[kind] : WINDOW_NAMES[kind]) ?? kind.replace(/_/g, ' ')
+}
+
+function span(ms: number): string {
+  const mins = Math.max(1, Math.round(ms / 60_000))
+  if (mins < 60) return `${mins}m`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `${hours}h ${mins % 60}m`
+  return `${Math.floor(hours / 24)}d ${hours % 24}h`
+}
+
+/** "resets in 2h 10m" for a reset time ahead of now; empty when unknown or past. */
+export function resetsIn(resetsAt: string | undefined, now: number): string {
+  const at = resetsAt ? Date.parse(resetsAt) : NaN
+  return Number.isFinite(at) && at > now ? `resets in ${span(at - now)}` : ''
+}
+
+const SAMPLE_CAP = 30
+const MIN_SPAN_MS = 2 * 60_000
+
+/** Adds a reading; a drop in percent means the window reset, so the history starts over. */
+export function addSample(list: LimitSample[] | undefined, sample: LimitSample): LimitSample[] {
+  const prev = list ?? []
+  const last = prev[prev.length - 1]
+  if (last && sample.percent < last.percent) return [sample]
+  return [...prev, sample].slice(-SAMPLE_CAP)
+}
+
+/**
+ * When the window fills at the pace of its readings: "limit in ~1h 20m".
+ * Empty with too little history, no climb, or a reset that comes first.
+ */
+export function burnRate(list: LimitSample[] | undefined, now: number, resetsAt?: string): string {
+  const first = list?.[0]
+  const last = list?.[list.length - 1]
+  if (!first || !last || last.at - first.at < MIN_SPAN_MS || last.percent <= first.percent) return ''
+  if (last.percent >= 100) return 'limit reached'
+  const perMs = (last.percent - first.percent) / (last.at - first.at)
+  const eta = (100 - last.percent) / perMs - (now - last.at)
+  const reset = resetsAt ? Date.parse(resetsAt) : NaN
+  if (Number.isFinite(reset) && now + eta >= reset) return ''
+  return `limit in ~${span(Math.max(0, eta))}`
+}
+
+/** Thresholds that toast once each: context at 80%, a rate-limit window at 90%. */
+export function crossedThresholds(
+  context: number | undefined,
+  limits: readonly { kind: string; percentUsed: number }[],
+  warned: readonly string[],
+): { key: string; text: string }[] {
+  const out: { key: string; text: string }[] = []
+  if ((context ?? 0) >= 80 && !warned.includes('context')) {
+    out.push({ key: 'context', text: `🟥 Context is ${Math.round(context ?? 0)}% full: /compact soon` })
+  }
+  for (const l of limits) {
+    if (l.percentUsed >= 90 && !warned.includes(l.kind)) {
+      out.push({ key: l.kind, text: `🟥 ${windowName(l.kind)} limit is at ${Math.round(l.percentUsed)}%` })
+    }
+  }
+  return out
+}
+
+/** Bar color by fill: calm, then warning at 60%, error at 80%. */
+export function levelColor(percent: number): 'success' | 'warning' | 'error' {
+  return percent >= 80 ? 'error' : percent >= 60 ? 'warning' : 'success'
+}
+
+/** How long a finished agent stays parked on the stage before it folds into the summary. */
+export const PARK_MS = 30_000
+
+export type Lane = {
+  id: string
+  icon: string
+  color: string
+  name: string
+  status: AgentNode['status']
+  bubble: string
+  waiting: string
+  stats: string
+}
+
+export type StageView = { lanes: Lane[]; folded: { icon: string; name: string; took: string }[] }
+
+/** The stage: Claude first, then running agents, then the ones parked under PARK_MS; the rest folded. */
+export function stageView(agents: Record<string, AgentNode>, now: number, max: number): StageView {
+  const all = Object.values(agents)
+  const main = all.filter(n => n.id === MAIN)
+  const running = all.filter(n => n.id !== MAIN && n.status === 'running').sort((a, b) => a.startedAt - b.startedAt)
+  const ended = all
+    .filter(n => n.id !== MAIN && n.status !== 'running')
+    .sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0))
+  const parked = ended.filter(n => now - (n.endedAt ?? now) < PARK_MS)
+  const shown = [...main, ...running, ...parked].slice(0, Math.max(1, max))
+  const shownIds = new Set(shown.map(n => n.id))
+
+  return {
+    lanes: shown.map(n => ({
+      id: n.id,
+      icon: n.icon,
+      color: n.color,
+      name: n.type,
+      status: n.status,
+      bubble: n.status === 'running' ? (n.tool ?? '') : '',
+      waiting: n.status === 'running' ? (n.waiting ?? '') : '',
+      stats: laneStats(n, now),
+    })),
+    folded: ended
+      .filter(n => !shownIds.has(n.id))
+      .map(n => ({ icon: n.icon, name: n.type, took: duration((n.endedAt ?? now) - n.startedAt) })),
+  }
+}
+
+function laneStats(n: AgentNode, now: number): string {
+  const parts = [`${shortModel(n.model)} ${n.effort ?? '–'}`, duration((n.endedAt ?? now) - n.startedAt), `🔧 ${n.tools}${n.failures ? ` ✘${n.failures}` : ''}`]
+  const used = agentTokens(n)
+  if (used > 0) parts.push(tokens(used))
+  const rate = cacheRate(n.cacheRead ?? 0, n.tokensIn ?? 0)
+  if (rate !== undefined) parts.push(`cache ${rate}%`)
+  return parts.join('   ')
 }
