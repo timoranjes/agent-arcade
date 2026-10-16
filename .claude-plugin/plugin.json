@@ -1,0 +1,6 @@
+{
+  "name": "agent-arcade",
+  "version": "0.1.0",
+  "description": "Playful live view of Claude and its subagents: a stats band, an agent tree pane, an activity feed and toasts",
+  "types": "./types/index.d.ts"
+}
